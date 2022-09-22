@@ -10,21 +10,17 @@ import timeit
 
 try:
     # Azure-specific imports
-    # pip install azure-common msrest msrestazure azure-mgmt-compute==12.0.0 azure-mgmt-network==10.2.0
-    from azure.common.credentials import ServicePrincipalCredentials
+    # pip install azure-identity msrest msrestazure azure-mgmt-compute azure-mgmt-network
+    from azure.identity import ClientSecretCredential
     from azure.mgmt.compute import ComputeManagementClient, models
     from azure.mgmt.network import NetworkManagementClient
     from msrest.polling import LROPoller
-    from msrestazure.polling.arm_polling import ARMPolling
 
     HAVE_AZURE = True
 except ImportError:
     HAVE_AZURE = False
     print("Missing machinery-required libraries.")
-    print("poetry run python -m pip install azure-common msrest msrestazure azure-mgmt-compute==12.0.0 azure-mgmt-network==10.2.0")
-
-# SQLAlchemy-specific imports
-from sqlalchemy.exc import SQLAlchemyError
+    print("poetry run python -m pip install azure-identity msrest msrestazure azure-mgmt-compute azure-mgmt-network")
 
 # Cuckoo-specific imports
 from lib.cuckoo.common.abstracts import Machinery
@@ -37,21 +33,23 @@ from lib.cuckoo.common.exceptions import (
     CuckooMachineError,
     CuckooOperationalError,
 )
-from lib.cuckoo.core.database import TASK_PENDING, Machine
+from lib.cuckoo.core.database import TASK_PENDING
 
 # Only log INFO or higher from imported python packages
 logging.getLogger("adal-python").setLevel(logging.INFO)
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+logging.getLogger("azure.identity._internal.get_token_mixin").setLevel(logging.WARNING)
+logging.getLogger("msal.authority").setLevel(logging.INFO)
+logging.getLogger("msal.application").setLevel(logging.INFO)
+logging.getLogger("msal.telemetry").setLevel(logging.INFO)
+logging.getLogger("msal.token_cache").setLevel(logging.INFO)
 logging.getLogger("msrest.universal_http").setLevel(logging.INFO)
 logging.getLogger("msrest.service_client").setLevel(logging.INFO)
 logging.getLogger("msrest.async_paging").setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
 # Timeout used for calls that shouldn't take longer than 5 minutes but somehow do
-AZURE_TIMEOUT = 300
-
-# Setting the timeout for the ARM Poller to 1 second
-if HAVE_AZURE:
-    ARM_POLLER = ARMPolling(1)
+AZURE_TIMEOUT = 120
 
 # Global variable which will maintain details about each machine pool
 machine_pools = {}
@@ -175,42 +173,42 @@ class Azure(Machinery):
 
     def _get_credentials(self):
         """
-        Used to instantiate the Azure ServicePrincipalCredentials object.
-        @return: an Azure ServicePrincipalCredentials object
+        Used to instantiate the Azure ClientSecretCredential object.
+        @return: an Azure ClientSecretCredential object
         """
 
-        # Instantiates the ServicePrincipalCredentials object using
+        # Instantiates the ClientSecretCredential object using
         # Azure client ID, secret and Azure tenant ID
-        credentials = ServicePrincipalCredentials(
+        credentials = ClientSecretCredential(
             client_id=self.options.az.client_id,
-            secret=self.options.az.secret,
-            tenant=self.options.az.tenant,
+            client_secret=self.options.az.secret,
+            tenant_id=self.options.az.tenant,
         )
         return credentials
 
     def _thr_refresh_clients(self):
         """
         A thread on a 30 minute timer that refreshes the network
-        and compute clients using an updated ServicePrincipalCredentials
+        and compute clients using an updated ClientSecretCredential
         object.
         """
         log.debug(f"Connecting to Azure for the region '{self.options.az.region_name}'.")
 
-        # Getting an updated ServicePrincipalCredentials
+        # Getting an updated ClientSecretCredential
         credentials = self._get_credentials()
 
         # Instantiates an Azure NetworkManagementClient using
-        # ServicePrincipalCredentials and subscription ID
+        # ClientSecretCredential and subscription ID
         self.network_client = NetworkManagementClient(
-            credentials,
-            self.options.az.subscription_id,
+            credential=credentials,
+            subscription_id=self.options.az.subscription_id
         )
 
         # Instantiates an Azure ComputeManagementClient using
-        # ServicePrincipalCredentials and subscription ID
+        # ClientSecretCredential and subscription ID
         self.compute_client = ComputeManagementClient(
-            credentials,
-            self.options.az.subscription_id,
+            credential=credentials,
+            subscription_id=self.options.az.subscription_id
         )
 
         # Refresh clients every half hour
@@ -286,7 +284,7 @@ class Azure(Machinery):
                     async_delete_vmss = Azure._azure_api_call(
                         self.options.az.sandbox_resource_group,
                         vmss.name,
-                        custom_poller=ARM_POLLER,
+                        polling_interval=1,
                         operation=self.compute_client.virtual_machine_scale_sets.delete,
                     )
                     _ = self._handle_poller_result(async_delete_vmss)
@@ -328,8 +326,8 @@ class Azure(Machinery):
                         self.options.az.sandbox_resource_group,
                         vmss.name,
                         vmss,
-                        custom_poller=ARM_POLLER,
-                        operation=self.compute_client.virtual_machine_scale_sets.update,
+                        polling_interval=1,
+                        operation=self.compute_client.virtual_machine_scale_sets.begin_update,
                     )
                     _ = self._handle_poller_result(update_vmss_image)
             else:
@@ -357,13 +355,12 @@ class Azure(Machinery):
         vmss_creation_threads = []
         vmss_reimage_threads = []
         for vmss, vals in self.required_vmsss.items():
-            if vals["exists"]:
+            if vals["exists"] and not self.options.az.just_start:
                 # Reimage VMSS!
                 thr = threading.Thread(
                     target=self._thr_reimage_vmss,
                     args=(
                         vmss,
-                        vals["tag"],
                     ),
                 )
                 vmss_reimage_threads.append(thr)
@@ -542,9 +539,7 @@ class Azure(Machinery):
                     log.debug(f"{vmss_vm.name} is currently being deleted!")
                     continue
                 # According to Microsoft, the OS type is...
-                os_type = vmss_vm.storage_profile.os_disk.os_type
-                # Extract the platform str
-                platform = str(os_type).split(".")[1]
+                platform = vmss_vm.storage_profile.os_disk.os_type.lower()
 
                 if not vmss_vm.network_profile:
                     log.error(f"{vmss_vm.name} does not have a network profile")
@@ -635,6 +630,8 @@ class Azure(Machinery):
         """
         Overloading abstracts.py:delete_machine()
         """
+        global vms_currently_being_deleted
+
         _ = super(Azure, self).delete_machine(label)
 
         if delete_from_vmss:
@@ -687,28 +684,28 @@ class Azure(Machinery):
             raise Exception("kwargs in _azure_api_call requires 'operation' parameter.")
         operation = kwargs["operation"]
 
-        # Note that tags is a special keyword parameter in some operations
-        tags = kwargs.get("tags", None)
-
         # This is used for logging
         api_call = f"{operation}({args})"
 
-        # Note that we are using a custom poller for some operations
-        custom_poller = kwargs.get("custom_poller", True)
+        # Note that we are using a custom polling interval for some operations
+        polling_interval = kwargs.get("polling_interval")
 
         try:
             log.debug(f"Trying {api_call}")
-            results = operation(*args, tags=tags, polling=custom_poller)
+            if polling_interval:
+                results = operation(*args, polling_interval=polling_interval)
+            else:
+                results = operation(*args)
         except Exception as exc:
             # For ClientRequestErrors, they do not have the attribute 'error'
             error = exc.error.error if getattr(exc, "error", False) else exc
-            log.warning(f"Failed to {api_call} due to the Azure error '{error}': '{exc.message}'.")
-            if "NotFound" in repr(exc) or exc.status_code == 404:
+            log.warning(f"Failed to {api_call} due to the Azure error '{error}': '{exc.message if hasattr(exc, 'message') else repr(exc)}'.")
+            if "NotFound" in repr(exc) or (hasattr(exc, "status_code") and exc.status_code == 404):
                 # Note that this exception is used to represent if an Azure resource
                 # has not been found, not just machines
-                raise CuckooMachineError(f"{error}:{exc.message}")
+                raise CuckooMachineError(f"{error}:{exc.message if hasattr(exc, 'message') else repr(exc)}")
             else:
-                raise CuckooMachineError(f"{error}:{exc.message}")
+                raise CuckooMachineError(f"{error}:{exc.message if hasattr(exc, 'message') else repr(exc)}")
         if type(results) == LROPoller:
             # Log the subscription limits
             headers = results._response.headers
@@ -784,15 +781,17 @@ class Azure(Machinery):
             single_placement_group=False,
             tags=Azure.AUTO_SCALE_CAPE_TAG,
             scale_in_policy=models.ScaleInPolicy(rules=[models.VirtualMachineScaleSetScaleInRules.newest_vm]),
+            spot_restore_policy=models.SpotRestorePolicy(enabled=True, restore_timeout=f"PT30M"),
         )
-        async_vmss_creation = Azure._azure_api_call(
-            self.options.az.sandbox_resource_group,
-            vmss_name,
-            vmss,
-            custom_poller=ARM_POLLER,
-            operation=self.compute_client.virtual_machine_scale_sets.create_or_update,
-        )
-        _ = self._handle_poller_result(async_vmss_creation)
+        if not self.options.az.just_start:
+            async_vmss_creation = Azure._azure_api_call(
+                self.options.az.sandbox_resource_group,
+                vmss_name,
+                vmss,
+                polling_interval=1,
+                operation=self.compute_client.virtual_machine_scale_sets.begin_create_or_update,
+            )
+            _ = self._handle_poller_result(async_vmss_creation)
 
         # Initialize key-value pair for VMSS with specific details
         machine_pools[vmss_name] = {
@@ -803,19 +802,18 @@ class Azure(Machinery):
         }
         self._add_machines_to_db(vmss_name)
 
-    def _thr_reimage_vmss(self, vmss_name, tag):
+    def _thr_reimage_vmss(self, vmss_name):
         """
         Reimage the VMSS
         @param vmss_name: the name of the VMSS to be reimage
-        @param tag: the tag used that represents the OS image
         """
         # Reset all machines via reimage_all
         try:
             async_reimage_all = Azure._azure_api_call(
                 self.options.az.sandbox_resource_group,
                 vmss_name,
-                custom_poller=ARM_POLLER,
-                operation=self.compute_client.virtual_machine_scale_sets.reimage_all,
+                polling_interval=1,
+                operation=self.compute_client.virtual_machine_scale_sets.begin_reimage_all,
             )
             _ = self._handle_poller_result(async_reimage_all)
         except CuckooMachineError as e:
@@ -825,7 +823,7 @@ class Azure(Machinery):
                 async_restart_vmss = Azure._azure_api_call(
                     self.options.az.sandbox_resource_group,
                     vmss_name,
-                    custom_poller=ARM_POLLER,
+                    polling_interval=1,
                     operation=self.compute_client.virtual_machine_scale_sets.restart,
                 )
                 _ = self._handle_poller_result(async_restart_vmss)
@@ -995,7 +993,7 @@ class Azure(Machinery):
                         ):
                             break
                         # Relaxxxx
-                        time.sleep(1)
+                        time.sleep(self.options.az.scale_down_polling_period)
                         log.debug(
                             f"Scaling {vmss_name} down until new task is received. {number_of_relevant_machines} -> {number_of_relevant_machines_required}"
                         )
@@ -1031,8 +1029,8 @@ class Azure(Machinery):
                     self.options.az.sandbox_resource_group,
                     vmss_name,
                     vmss,
-                    custom_poller=ARM_POLLER,
-                    operation=self.compute_client.virtual_machine_scale_sets.update,
+                    polling_interval=1,
+                    operation=self.compute_client.virtual_machine_scale_sets.begin_update,
                 )
                 _ = self._handle_poller_result(async_update_vmss)
                 current_vmss_operations -= 1
@@ -1198,9 +1196,9 @@ class Azure(Machinery):
                 async_reimage_some_machines = Azure._azure_api_call(
                     self.options.az.sandbox_resource_group,
                     vmss_to_reimage,
-                    instance_ids,
-                    custom_poller=ARM_POLLER,
-                    operation=self.compute_client.virtual_machine_scale_sets.reimage_all,
+                    models.VirtualMachineScaleSetVMInstanceIDs(instance_ids=instance_ids),
+                    polling_interval=1,
+                    operation=self.compute_client.virtual_machine_scale_sets.begin_reimage_all,
                 )
             except Exception as exc:
                 log.error(repr(exc), exc_info=True)
@@ -1294,9 +1292,9 @@ class Azure(Machinery):
                 async_delete_some_machines = Azure._azure_api_call(
                     self.options.az.sandbox_resource_group,
                     vmss_to_delete,
-                    instance_ids,
-                    custom_poller=ARM_POLLER,
-                    operation=self.compute_client.virtual_machine_scale_sets.delete_instances,
+                    models.VirtualMachineScaleSetVMInstanceIDs(instance_ids=instance_ids),
+                    polling_interval=1,
+                    operation=self.compute_client.virtual_machine_scale_sets.begin_delete_instances,
                 )
             except Exception as exc:
                 log.error(repr(exc), exc_info=True)
